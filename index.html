@@ -17,7 +17,6 @@
   .drop.over{border-color:var(--accent);color:var(--accent)}
   .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
   button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   button:disabled{opacity:.5;cursor:default}
   video,canvas.preview{width:100%;max-height:340px;object-fit:contain;border-radius:8px;background:#000;display:block}
   canvas.preview{background:transparent;margin-top:12px}
@@ -43,7 +42,7 @@
       <button id="stopBtn" class="hidden">카메라 중지</button>
     </div>
     <video id="video" class="hidden" playsinline muted style="margin-top:12px"></video>
-    <div id="status" class="status"></div>
+    <div id="status" class="status">인식 엔진 불러오는 중...</div>
   </div>
 
   <div class="card">
@@ -52,87 +51,126 @@
   </div>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.7/dist/iife/reader/index.js"></script>
 <script>
-const Z = ZXing;
 const $ = id => document.getElementById(id);
-const statusEl = $('status'), resultsEl = $('results'), preview = $('preview');
-
-const hints = new Map();
-hints.set(Z.DecodeHintType.TRY_HARDER, true);
-hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [
-  Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.PDF_417,
-  Z.BarcodeFormat.AZTEC, Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.CODE_39,
-  Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A,
-  Z.BarcodeFormat.ITF, Z.BarcodeFormat.CODABAR
-]);
-const reader = new Z.MultiFormatReader();
-reader.setHints(hints);
-
+const statusEl = $('status'), resultsEl = $('results'), preview = $('preview'), video = $('video');
 function setStatus(msg, cls){ statusEl.textContent = msg; statusEl.className = 'status ' + (cls||''); }
+const tick = () => new Promise(r => setTimeout(r, 0));
 
-// canvas -> 디코딩 시도 (원본/반전)
-function decodeCanvas(c){
-  const ctx = c.getContext('2d', {willReadFrequently:true});
-  const img = ctx.getImageData(0,0,c.width,c.height);
-  const src = new Z.RGBLuminanceSource(toLuma(img.data), c.width, c.height);
-  for (const s of [src, src.invert()]) {
-    for (const Bin of [Z.HybridBinarizer, Z.GlobalHistogramBinarizer]) {
-      try { return reader.decode(new Z.BinaryBitmap(new Bin(s))); } catch(e){}
-    }
-  }
-  return null;
+/* ---------- 엔진 ---------- */
+let engineOK = false;
+try {
+  ZXingWASM.setZXingModuleOverrides({
+    locateFile: (p, prefix) => p.endsWith('.wasm')
+      ? 'https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.7/dist/reader/' + p : prefix + p
+  });
+  ZXingWASM.prepareZXingModule({fireImmediately:true}).then(() => { engineOK = true; setStatus(''); })
+    .catch(() => setStatus('인식 엔진을 불러오지 못했습니다. 인터넷 연결을 확인하십시오.', 'err'));
+} catch(e){ setStatus('인식 엔진을 불러오지 못했습니다. 인터넷 연결을 확인하십시오.', 'err'); }
+
+const READ_OPTS = {tryHarder:true, tryRotate:true, tryInvert:true, tryDownscale:true, maxNumberOfSymbols:1};
+
+async function readImageData(id){
+  const res = await ZXingWASM.readBarcodes(id, READ_OPTS);
+  return res.find(r => r.isValid && r.text) || null;
 }
-function toLuma(d){
-  const n = d.length/4, out = new Uint8ClampedArray(n);
-  for (let i=0;i<n;i++) out[i] = (d[i*4]*299 + d[i*4+1]*587 + d[i*4+2]*114)/1000;
-  return out;
-}
-function drawScaled(img, w, h, rot=0, crop){
+
+/* ---------- 전처리 ---------- */
+// 소스(이미지/비디오)의 일부 영역을 maxSide 이내로 그린 캔버스
+function render(src, maxSide, crop){
+  const sw = src.naturalWidth || src.videoWidth || src.width, sh = src.naturalHeight || src.videoHeight || src.height;
+  const cx = crop ? crop.x*sw : 0, cy = crop ? crop.y*sh : 0;
+  const cw = crop ? crop.w*sw : sw, ch = crop ? crop.h*sh : sh;
+  const k = Math.min(1, maxSide / Math.max(cw, ch));
   const c = document.createElement('canvas');
-  const sw = crop? crop.w : (img.naturalWidth||img.videoWidth||img.width);
-  const sh = crop? crop.h : (img.naturalHeight||img.videoHeight||img.height);
-  const sx = crop? crop.x : 0, sy = crop? crop.y : 0;
-  const swap = rot%180!==0;
-  c.width = swap? h : w; c.height = swap? w : h;
-  const ctx = c.getContext('2d', {willReadFrequently:true});
-  ctx.fillStyle='#fff'; ctx.fillRect(0,0,c.width,c.height);
-  ctx.translate(c.width/2, c.height/2); ctx.rotate(rot*Math.PI/180);
-  ctx.drawImage(img, sx, sy, sw, sh, -w/2, -h/2, w, h);
+  c.width = Math.max(1, Math.round(cw*k)); c.height = Math.max(1, Math.round(ch*k));
+  c.getContext('2d', {willReadFrequently:true}).drawImage(src, cx, cy, cw, ch, 0, 0, c.width, c.height);
   return c;
 }
-
-// 여러 배율·회전·분할 영역으로 반복 시도
-function decodeImage(img){
-  const W = img.naturalWidth||img.videoWidth||img.width, H = img.naturalHeight||img.videoHeight||img.height;
-  const crops = [null];
-  // 전체 + 3x3 중 겹치는 영역(코드가 사진의 일부일 때 대비)
-  for (const f of [0.7, 0.5]) {
-    const cw = W*f, ch = H*f;
-    for (let ix=0; ix<=2; ix++) for (let iy=0; iy<=2; iy++)
-      crops.push({x:(W-cw)*ix/2, y:(H-ch)*iy/2, w:cw, h:ch});
+function grayOf(c){
+  const d = c.getContext('2d', {willReadFrequently:true}).getImageData(0,0,c.width,c.height).data;
+  const g = new Uint8Array(c.width*c.height);
+  for (let i=0;i<g.length;i++) g[i] = (d[i*4]*299 + d[i*4+1]*587 + d[i*4+2]*114)/1000;
+  return g;
+}
+// 3x3 최대값 필터 = 어두운 영역 축소(잉크 번짐 보정)
+function thin(g, w, h, times){
+  let s = g;
+  for (let t=0;t<times;t++){
+    const tmp = new Uint8Array(w*h), o = new Uint8Array(w*h);
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++){
+      const i=y*w+x; let m=s[i]; if(x>0&&s[i-1]>m)m=s[i-1]; if(x<w-1&&s[i+1]>m)m=s[i+1]; tmp[i]=m;
+    }
+    for (let y=0;y<h;y++) for (let x=0;x<w;x++){
+      const i=y*w+x; let m=tmp[i]; if(y>0&&tmp[i-w]>m)m=tmp[i-w]; if(y<h-1&&tmp[i+w]>m)m=tmp[i+w]; o[i]=m;
+    }
+    s = o;
   }
-  for (const crop of crops) {
-    const bw = crop? crop.w : W, bh = crop? crop.h : H;
-    for (const maxSide of [1000, 600, 1600]) {
-      const k = Math.min(1, maxSide/Math.max(bw,bh));
-      const w = Math.round(bw*k), h = Math.round(bh*k);
-      for (const rot of [0, 90, 180, 270]) {
-        const r = decodeCanvas(drawScaled(img, w, h, rot, crop));
-        if (r) return r;
-      }
+  return s;
+}
+function otsu(g){
+  const hist = new Array(256).fill(0); for (const v of g) hist[v]++;
+  let sum=0; for (let i=0;i<256;i++) sum+=i*hist[i];
+  let wB=0, sB=0, best=0, thr=128;
+  for (let t=0;t<256;t++){
+    wB += hist[t]; if(!wB) continue; const wF = g.length-wB; if(!wF) break;
+    sB += t*hist[t]; const mB=sB/wB, mF=(sum-sB)/wF, v=wB*wF*(mB-mF)*(mB-mF);
+    if (v>best){best=v;thr=t;}
+  }
+  return thr;
+}
+function toImageData(g, w, h){
+  const out = new Uint8ClampedArray(w*h*4);
+  for (let i=0;i<g.length;i++){ out[i*4]=out[i*4+1]=out[i*4+2]=g[i]; out[i*4+3]=255; }
+  return new ImageData(out, w, h);
+}
+function binarize(g, thr){ const o = new Uint8Array(g.length); for (let i=0;i<g.length;i++) o[i] = g[i] < thr ? 0 : 255; return o; }
+
+// 한 장의 캔버스에 대해 전처리 변형을 순서대로 시도 (fast=true면 가벼운 변형만)
+async function decodeCanvas(c, fast){
+  const w = c.width, h = c.height;
+  const g = grayOf(c);
+  // 1) 원본
+  let r = await readImageData(c.getContext('2d').getImageData(0,0,w,h));
+  if (r) return r;
+  // 2) 잉크 번짐 보정(축소) 1~2회
+  const variants = fast ? [1,2] : [1,2,3];
+  for (const n of variants){
+    r = await readImageData(toImageData(thin(g,w,h,n), w, h)); if (r) return r;
+  }
+  if (fast) return null;
+  // 3) 이진화(Otsu) + 축소
+  const t = otsu(g);
+  for (const [thr, n] of [[t,0],[t,1],[t,2],[t*0.8,1],[Math.min(255,t*1.2),2]]){
+    r = await readImageData(toImageData(thin(binarize(g,thr),w,h,n), w, h)); if (r) return r;
+  }
+  return null;
+}
+
+// 사진 전체 → 분할 영역 순으로 시도
+async function decodeImage(img, onProgress){
+  const crops = [null];
+  for (const f of [0.6, 0.4]) for (const ix of [0,.5,1]) for (const iy of [0,.5,1]) crops.push({x:(1-f)*ix, y:(1-f)*iy, w:f, h:f});
+  let n = 0;
+  for (const crop of crops){
+    for (const side of (crop ? [1000] : [1000, 700, 500, 1600])){
+      onProgress && onProgress(++n);
+      const r = await decodeCanvas(render(img, side, crop), false);
+      if (r) return r;
+      await tick();
     }
   }
   return null;
 }
 
+/* ---------- 결과 표시 ---------- */
 function showResult(r){
-  const text = r.getText();
-  const fmt = Z.BarcodeFormat[r.getBarcodeFormat()];
+  const text = r.text;
   if (resultsEl.querySelector('.status')) resultsEl.innerHTML = '';
   const box = document.createElement('div'); box.className = 'result';
   box.innerHTML = '<div class="meta"></div><pre></pre>';
-  box.querySelector('.meta').textContent = `${fmt} · ${text.length}자 · ${new Date().toLocaleTimeString('ko-KR')}`;
+  box.querySelector('.meta').textContent = `${r.format} · ${text.length}자 · ${new Date().toLocaleTimeString('ko-KR')}`;
   box.querySelector('pre').textContent = text;
   const row = document.createElement('div'); row.className = 'row';
   const b = document.createElement('button'); b.textContent = '복사';
@@ -141,29 +179,28 @@ function showResult(r){
   resultsEl.prepend(box);
 }
 
-function loadFile(file){
+/* ---------- 이미지 입력 ---------- */
+let loading = false;
+async function loadFile(file){
   if (!file || !file.type.startsWith('image/')) return setStatus('이미지 파일만 가능합니다.', 'err');
+  if (!engineOK) { try { await ZXingWASM.prepareZXingModule({fireImmediately:true}); engineOK = true; } catch { return setStatus('인식 엔진이 아직 준비되지 않았습니다.', 'err'); } }
+  if (loading) return; loading = true;
   stopCamera();
   const url = URL.createObjectURL(file);
-  const img = new Image();
-  img.onload = () => {
+  try {
+    const img = new Image(); img.src = url; await img.decode();
     const k = Math.min(1, 900/img.naturalWidth);
     preview.width = img.naturalWidth*k; preview.height = img.naturalHeight*k;
     preview.getContext('2d').drawImage(img,0,0,preview.width,preview.height);
     preview.classList.remove('hidden');
     setStatus('인식 중...');
-    setTimeout(() => {
-      const r = decodeImage(img);
-      URL.revokeObjectURL(url);
-      if (r) { showResult(r); setStatus('인식 성공', 'ok'); }
-      else setStatus('인식하지 못했습니다. 코드 전체가 선명하게 보이도록 가깝게 다시 촬영해 주십시오.', 'err');
-    }, 30);
-  };
-  img.onerror = () => setStatus('이미지를 열 수 없습니다.', 'err');
-  img.src = url;
+    await tick();
+    const r = await decodeImage(img, n => setStatus(`인식 중... (시도 ${n})`));
+    if (r) { showResult(r); setStatus('인식 성공', 'ok'); }
+    else setStatus('인식하지 못했습니다. 코드 전체가 선명하게 보이도록, 코드 주변에 여백을 두고 다시 촬영해 주십시오.', 'err');
+  } catch(e){ setStatus('이미지를 열 수 없습니다.', 'err'); }
+  finally { URL.revokeObjectURL(url); loading = false; }
 }
-
-// 입력: 클릭/드롭/붙여넣기
 const drop = $('drop'), fileInput = $('file');
 drop.onclick = () => fileInput.click();
 fileInput.onchange = e => { loadFile(e.target.files[0]); fileInput.value=''; };
@@ -175,29 +212,33 @@ document.addEventListener('paste', e => {
   if (f) loadFile(f);
 });
 
-// 카메라 스캔
-let stream = null, timer = null, busy = false;
-const video = $('video');
+/* ---------- 카메라 ---------- */
+let stream = null, running = false;
 async function startCamera(){
   try {
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}}});
-  } catch(e){ return setStatus('카메라를 사용할 수 없습니다. (HTTPS 또는 localhost 필요, 권한 확인)', 'err'); }
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}});
+  } catch(e){ return setStatus('카메라를 사용할 수 없습니다. (HTTPS 필요, 카메라 권한 확인)', 'err'); }
+  try { // 연속 초점 지원 시 적용
+    const track = stream.getVideoTracks()[0], caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.focusMode && caps.focusMode.includes('continuous')) await track.applyConstraints({advanced:[{focusMode:'continuous'}]});
+  } catch(e){}
   video.srcObject = stream; await video.play();
   video.classList.remove('hidden'); $('stopBtn').classList.remove('hidden'); $('camBtn').disabled = true;
-  setStatus('코드를 화면 중앙에 맞춰 주십시오.');
-  timer = setInterval(() => {
-    if (busy || !video.videoWidth) return;
-    busy = true;
-    try {
-      const k = Math.min(1, 1000/video.videoWidth);
-      const c = drawScaled(video, Math.round(video.videoWidth*k), Math.round(video.videoHeight*k));
-      const r = decodeCanvas(c);
-      if (r) { showResult(r); setStatus('인식 성공', 'ok'); stopCamera(); }
-    } finally { busy = false; }
-  }, 250);
+  setStatus('코드를 화면 중앙에 맞추고 초점이 잡힐 때까지 잠시 유지하십시오.');
+  running = true;
+  while (running) {
+    if (video.videoWidth) {
+      for (const crop of [null, {x:.2,y:.2,w:.6,h:.6}]) {
+        if (!running) break;
+        const r = await decodeCanvas(render(video, 900, crop), true);
+        if (r) { showResult(r); setStatus('인식 성공', 'ok'); stopCamera(); break; }
+      }
+    }
+    await new Promise(r => setTimeout(r, 120));
+  }
 }
 function stopCamera(){
-  clearInterval(timer); timer = null;
+  running = false;
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; video.classList.add('hidden'); $('stopBtn').classList.add('hidden'); $('camBtn').disabled = false;
 }
