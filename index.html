@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>바코드 리더</title>
+<style>
+  :root{--bg:#f5f6f8;--card:#fff;--text:#1d2330;--sub:#6b7280;--line:#dfe3ea;--accent:#1f5eff;--ok:#0f9d58;--err:#d93025}
+  @media (prefers-color-scheme:dark){:root{--bg:#12151c;--card:#1b1f29;--text:#e8ebf2;--sub:#98a1b3;--line:#2c3240;--accent:#6b95ff;--ok:#3ddc84;--err:#ff6b60}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 "Malgun Gothic",system-ui,sans-serif}
+  main{max-width:760px;margin:0 auto;padding:24px 16px 48px}
+  h1{font-size:20px;margin:0 0 4px}
+  p.sub{color:var(--sub);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+  .drop{border:2px dashed var(--line);border-radius:12px;padding:28px 12px;text-align:center;color:var(--sub);cursor:pointer}
+  .drop.over{border-color:var(--accent);color:var(--accent)}
+  .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--text);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.5;cursor:default}
+  video,canvas.preview{width:100%;max-height:340px;object-fit:contain;border-radius:8px;background:#000;display:block}
+  canvas.preview{background:transparent;margin-top:12px}
+  .hidden{display:none}
+  .status{margin-top:12px;font-size:14px;color:var(--sub)}
+  .status.ok{color:var(--ok)}.status.err{color:var(--err)}
+  .result{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:10px}
+  .result .meta{font-size:12px;color:var(--sub);margin-bottom:4px}
+  .result pre{margin:0;white-space:pre-wrap;word-break:break-all;font:14px/1.5 Consolas,monospace;user-select:all}
+</style>
+</head>
+<body>
+<main>
+  <h1>바코드 리더</h1>
+  <p class="sub">Data Matrix · QR · Code128 등 1D/2D 바코드를 이미지 또는 카메라로 인식해 문자열을 추출합니다. 모든 처리는 브라우저 안에서만 이루어집니다.</p>
+
+  <div class="card">
+    <div class="drop" id="drop">이미지를 끌어다 놓거나, 클릭해 선택하거나, Ctrl+V로 붙여넣으십시오</div>
+    <input type="file" id="file" accept="image/*" class="hidden">
+    <canvas id="preview" class="preview hidden"></canvas>
+    <div class="row">
+      <button id="camBtn">카메라로 스캔</button>
+      <button id="stopBtn" class="hidden">카메라 중지</button>
+    </div>
+    <video id="video" class="hidden" playsinline muted style="margin-top:12px"></video>
+    <div id="status" class="status"></div>
+  </div>
+
+  <div class="card">
+    <strong>인식 결과</strong>
+    <div id="results"><div class="status">아직 결과가 없습니다.</div></div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
+<script>
+const Z = ZXing;
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), resultsEl = $('results'), preview = $('preview');
+
+const hints = new Map();
+hints.set(Z.DecodeHintType.TRY_HARDER, true);
+hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [
+  Z.BarcodeFormat.DATA_MATRIX, Z.BarcodeFormat.QR_CODE, Z.BarcodeFormat.PDF_417,
+  Z.BarcodeFormat.AZTEC, Z.BarcodeFormat.CODE_128, Z.BarcodeFormat.CODE_39,
+  Z.BarcodeFormat.EAN_13, Z.BarcodeFormat.EAN_8, Z.BarcodeFormat.UPC_A,
+  Z.BarcodeFormat.ITF, Z.BarcodeFormat.CODABAR
+]);
+const reader = new Z.MultiFormatReader();
+reader.setHints(hints);
+
+function setStatus(msg, cls){ statusEl.textContent = msg; statusEl.className = 'status ' + (cls||''); }
+
+// canvas -> 디코딩 시도 (원본/반전)
+function decodeCanvas(c){
+  const ctx = c.getContext('2d', {willReadFrequently:true});
+  const img = ctx.getImageData(0,0,c.width,c.height);
+  const src = new Z.RGBLuminanceSource(toLuma(img.data), c.width, c.height);
+  for (const s of [src, src.invert()]) {
+    for (const Bin of [Z.HybridBinarizer, Z.GlobalHistogramBinarizer]) {
+      try { return reader.decode(new Z.BinaryBitmap(new Bin(s))); } catch(e){}
+    }
+  }
+  return null;
+}
+function toLuma(d){
+  const n = d.length/4, out = new Uint8ClampedArray(n);
+  for (let i=0;i<n;i++) out[i] = (d[i*4]*299 + d[i*4+1]*587 + d[i*4+2]*114)/1000;
+  return out;
+}
+function drawScaled(img, w, h, rot=0, crop){
+  const c = document.createElement('canvas');
+  const sw = crop? crop.w : (img.naturalWidth||img.videoWidth||img.width);
+  const sh = crop? crop.h : (img.naturalHeight||img.videoHeight||img.height);
+  const sx = crop? crop.x : 0, sy = crop? crop.y : 0;
+  const swap = rot%180!==0;
+  c.width = swap? h : w; c.height = swap? w : h;
+  const ctx = c.getContext('2d', {willReadFrequently:true});
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,c.width,c.height);
+  ctx.translate(c.width/2, c.height/2); ctx.rotate(rot*Math.PI/180);
+  ctx.drawImage(img, sx, sy, sw, sh, -w/2, -h/2, w, h);
+  return c;
+}
+
+// 여러 배율·회전·분할 영역으로 반복 시도
+function decodeImage(img){
+  const W = img.naturalWidth||img.videoWidth||img.width, H = img.naturalHeight||img.videoHeight||img.height;
+  const crops = [null];
+  // 전체 + 3x3 중 겹치는 영역(코드가 사진의 일부일 때 대비)
+  for (const f of [0.7, 0.5]) {
+    const cw = W*f, ch = H*f;
+    for (let ix=0; ix<=2; ix++) for (let iy=0; iy<=2; iy++)
+      crops.push({x:(W-cw)*ix/2, y:(H-ch)*iy/2, w:cw, h:ch});
+  }
+  for (const crop of crops) {
+    const bw = crop? crop.w : W, bh = crop? crop.h : H;
+    for (const maxSide of [1000, 600, 1600]) {
+      const k = Math.min(1, maxSide/Math.max(bw,bh));
+      const w = Math.round(bw*k), h = Math.round(bh*k);
+      for (const rot of [0, 90, 180, 270]) {
+        const r = decodeCanvas(drawScaled(img, w, h, rot, crop));
+        if (r) return r;
+      }
+    }
+  }
+  return null;
+}
+
+function showResult(r){
+  const text = r.getText();
+  const fmt = Z.BarcodeFormat[r.getBarcodeFormat()];
+  if (resultsEl.querySelector('.status')) resultsEl.innerHTML = '';
+  const box = document.createElement('div'); box.className = 'result';
+  box.innerHTML = '<div class="meta"></div><pre></pre>';
+  box.querySelector('.meta').textContent = `${fmt} · ${text.length}자 · ${new Date().toLocaleTimeString('ko-KR')}`;
+  box.querySelector('pre').textContent = text;
+  const row = document.createElement('div'); row.className = 'row';
+  const b = document.createElement('button'); b.textContent = '복사';
+  b.onclick = async () => { try { await navigator.clipboard.writeText(text); b.textContent='복사됨'; } catch { b.textContent='복사 실패'; } setTimeout(()=>b.textContent='복사',1200); };
+  row.appendChild(b); box.appendChild(row);
+  resultsEl.prepend(box);
+}
+
+function loadFile(file){
+  if (!file || !file.type.startsWith('image/')) return setStatus('이미지 파일만 가능합니다.', 'err');
+  stopCamera();
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    const k = Math.min(1, 900/img.naturalWidth);
+    preview.width = img.naturalWidth*k; preview.height = img.naturalHeight*k;
+    preview.getContext('2d').drawImage(img,0,0,preview.width,preview.height);
+    preview.classList.remove('hidden');
+    setStatus('인식 중...');
+    setTimeout(() => {
+      const r = decodeImage(img);
+      URL.revokeObjectURL(url);
+      if (r) { showResult(r); setStatus('인식 성공', 'ok'); }
+      else setStatus('인식하지 못했습니다. 코드 전체가 선명하게 보이도록 가깝게 다시 촬영해 주십시오.', 'err');
+    }, 30);
+  };
+  img.onerror = () => setStatus('이미지를 열 수 없습니다.', 'err');
+  img.src = url;
+}
+
+// 입력: 클릭/드롭/붙여넣기
+const drop = $('drop'), fileInput = $('file');
+drop.onclick = () => fileInput.click();
+fileInput.onchange = e => { loadFile(e.target.files[0]); fileInput.value=''; };
+['dragenter','dragover'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(t => drop.addEventListener(t, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => loadFile(e.dataTransfer.files[0]));
+document.addEventListener('paste', e => {
+  const f = [...(e.clipboardData?.files||[])].find(f => f.type.startsWith('image/'));
+  if (f) loadFile(f);
+});
+
+// 카메라 스캔
+let stream = null, timer = null, busy = false;
+const video = $('video');
+async function startCamera(){
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}}});
+  } catch(e){ return setStatus('카메라를 사용할 수 없습니다. (HTTPS 또는 localhost 필요, 권한 확인)', 'err'); }
+  video.srcObject = stream; await video.play();
+  video.classList.remove('hidden'); $('stopBtn').classList.remove('hidden'); $('camBtn').disabled = true;
+  setStatus('코드를 화면 중앙에 맞춰 주십시오.');
+  timer = setInterval(() => {
+    if (busy || !video.videoWidth) return;
+    busy = true;
+    try {
+      const k = Math.min(1, 1000/video.videoWidth);
+      const c = drawScaled(video, Math.round(video.videoWidth*k), Math.round(video.videoHeight*k));
+      const r = decodeCanvas(c);
+      if (r) { showResult(r); setStatus('인식 성공', 'ok'); stopCamera(); }
+    } finally { busy = false; }
+  }, 250);
+}
+function stopCamera(){
+  clearInterval(timer); timer = null;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null; video.classList.add('hidden'); $('stopBtn').classList.add('hidden'); $('camBtn').disabled = false;
+}
+$('camBtn').onclick = startCamera;
+$('stopBtn').onclick = () => { stopCamera(); setStatus(''); };
+</script>
+</body>
+</html>
